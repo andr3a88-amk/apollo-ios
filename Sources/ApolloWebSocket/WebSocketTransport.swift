@@ -97,6 +97,9 @@ public class WebSocketTransport {
     public fileprivate(set) var connectingPayload: JSONEncodableDictionary?
     /// The `RequestBodyCreator` to use when serializing requests. Defaults to an `ApolloRequestBodyCreator`.
     public let requestBodyCreator: any RequestBodyCreator
+
+    /// The `RequestBodyCreator` to use when serializing requests. Defaults to an `ApolloRequestBodyCreator`.
+    public let requestBodyCreatorAsync: (any RequestBodyCreatorAsync)?
     /// The `OperationMessageIdCreator` used to generate a unique message identifier per request.
     /// Defaults to `ApolloSequencedOperationMessageIdCreator`.
     public let operationMessageIdCreator: any OperationMessageIdCreator
@@ -111,6 +114,7 @@ public class WebSocketTransport {
       connectOnInit: Bool = true,
       connectingPayload: JSONEncodableDictionary? = [:],
       requestBodyCreator: any RequestBodyCreator = ApolloRequestBodyCreator(),
+      requestBodyCreatorAsync: (any RequestBodyCreatorAsync)? = nil,
       operationMessageIdCreator: any OperationMessageIdCreator = ApolloSequencedOperationMessageIdCreator()
     ) {
       self.clientName = clientName
@@ -121,6 +125,7 @@ public class WebSocketTransport {
       self.connectOnInit = connectOnInit
       self.connectingPayload = connectingPayload
       self.requestBodyCreator = requestBodyCreator
+      self.requestBodyCreatorAsync = requestBodyCreatorAsync
       self.operationMessageIdCreator = operationMessageIdCreator
     }
   }
@@ -324,9 +329,6 @@ public class WebSocketTransport {
   }
 
   func sendHelper<Operation: GraphQLOperation>(operation: Operation, resultHandler: @escaping (_ result: Result<JSONObject, any Error>) -> Void) -> String? {
-    let body = config.requestBodyCreator.requestBody(for: operation,
-                                              sendQueryDocument: true,
-                                              autoPersistQuery: false)
     let identifier = config.operationMessageIdCreator.requestId()
 
     let messageType: OperationMessage.Types
@@ -336,20 +338,46 @@ public class WebSocketTransport {
     default: return nil
     }
 
-    guard let message = OperationMessage(payload: body, id: identifier, type: messageType).rawMessage else {
-      return nil
-    }
+    if let requestBodyCreatorAsync = config.requestBodyCreatorAsync {
+      requestBodyCreatorAsync.requestBody(for: operation,
+                                          sendQueryDocument: true,
+                                          autoPersistQuery: false) { [weak self] body in
+        guard let self else { return }
 
-    processingQueue.async {
-      self.write(message)
+        guard let message = OperationMessage(payload: body, id: identifier, type: messageType).rawMessage else {
+          return
+        }
 
-      self.subscribers[identifier] = resultHandler
-      if Operation.operationType == .subscription {
-        self.subscriptions[identifier] = message
+        self.processingQueue.async {
+          self.write(message)
+
+          self.subscribers[identifier] = resultHandler
+          if Operation.operationType == .subscription {
+            self.subscriptions[identifier] = message
+          }
+        }
+
       }
-    }
+      return identifier
+    } else {
+      let body = config.requestBodyCreator.requestBody(for: operation,
+                                                       sendQueryDocument: true,
+                                                       autoPersistQuery: false)
+      guard let message = OperationMessage(payload: body, id: identifier, type: messageType).rawMessage else {
+        return nil
+      }
 
-    return identifier
+      processingQueue.async {
+        self.write(message)
+
+        self.subscribers[identifier] = resultHandler
+        if Operation.operationType == .subscription {
+          self.subscriptions[identifier] = message
+        }
+      }
+
+      return identifier
+    }
   }
 
   public func unsubscribe(_ subscriptionId: String) {
