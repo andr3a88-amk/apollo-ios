@@ -172,10 +172,14 @@ public class WebSocketTransport {
     self.addApolloClientHeaders(to: &self.websocket.request)
 
     self.websocket.delegate = self
+    // Keep the assignment of the callback queue before attempting to connect. There is the
+    // potential of a data race if the connection fails early and the disconnect logic reads
+    // the callback queue while it's being set.
+    self.websocket.callbackQueue = processingQueue
+
     if config.connectOnInit {
       self.websocket.connect()
     }
-    self.websocket.callbackQueue = processingQueue
   }
 
   public func isConnected() -> Bool {
@@ -198,10 +202,21 @@ public class WebSocketTransport {
       }
 
       switch messageType {
-      case .data,
-           .next,
-           .error:
-        if let id = parseHandler.id, let responseHandler = subscribers[id] {
+      case .data, .next, .error:
+        guard let id = parseHandler.id else {
+          let websocketError = WebSocketError(
+            payload: parseHandler.payload,
+            error: parseHandler.error,
+            kind: .unprocessedMessage(text)
+          )
+          self.notifyErrorAllHandlers(websocketError)
+
+          break
+        }
+
+        // If we have a handler ID but no subscriber exists for that ID then the
+        // subscriber probably unsubscribed.
+        if let responseHandler = subscribers[id] {
           if let payload = parseHandler.payload {
             responseHandler(.success(payload))
           } else if let error = parseHandler.error {
@@ -212,11 +227,6 @@ public class WebSocketTransport {
                                                 kind: .neitherErrorNorPayloadReceived)
             responseHandler(.failure(websocketError))
           }
-        } else {
-          let websocketError = WebSocketError(payload: parseHandler.payload,
-                                              error: parseHandler.error,
-                                              kind: .unprocessedMessage(text))
-          self.notifyErrorAllHandlers(websocketError)
         }
       case .complete:
         if let id = parseHandler.id {
